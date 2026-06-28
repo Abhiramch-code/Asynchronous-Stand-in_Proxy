@@ -1,0 +1,244 @@
+# Copyright 2026 Abhiram
+# Asynchronous Stand-In Proxy — FastAPI Server Endpoints
+#
+# This module defines the REST API endpoints that expose the ADK Orchestrator
+# agent to external clients (future React dashboard, MCP server, etc.).
+#
+# Endpoints:
+#   POST /api/v1/proxy/analyze  — Send a transcript chunk, get agent response
+#   GET  /api/v1/proxy/status   — Health check
+#   GET  /api/v1/proxy/deferred — List deferred (authority boundary) items
+
+from __future__ import annotations
+
+import logging
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import APIRouter, HTTPException
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+from pydantic import BaseModel, Field
+
+load_dotenv(override=True)
+
+# Re-export GEMINI_API_KEY as GOOGLE_API_KEY if needed by ADK
+if os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+
+from app.agents.orchestrator import create_orchestrator_agent  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Pydantic Models
+# ---------------------------------------------------------------------------
+
+
+class MeetingRequest(BaseModel):
+    """Request payload for the /analyze endpoint."""
+
+    transcript_chunk: str = Field(
+        ...,
+        description="A chunk of meeting transcript text to analyze.",
+        min_length=1,
+        max_length=5000,
+        examples=[
+            "Sarah: Hey Abhiram, can you confirm the auth approach for Project Alpha?"
+        ],
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Optional session ID to continue a conversation. "
+        "If not provided, a new session is created.",
+    )
+
+
+class ProxyResponse(BaseModel):
+    """Response payload from the /analyze endpoint."""
+
+    session_id: str = Field(description="The session ID for this conversation.")
+    agent_response: str = Field(description="The agent's response to the transcript.")
+    was_deferred: bool = Field(
+        default=False,
+        description="True if the response hit the authority boundary and was deferred.",
+    )
+    timestamp: str = Field(description="ISO 8601 timestamp of the response.")
+
+
+class DeferredItem(BaseModel):
+    """A transcript item that was deferred due to authority boundary."""
+
+    transcript_chunk: str
+    agent_response: str
+    timestamp: str
+    session_id: str
+
+
+class HealthStatus(BaseModel):
+    """Health check response."""
+
+    status: str = "ok"
+    service: str = "stand-in-proxy"
+    version: str = "0.1.0"
+    timestamp: str
+
+
+# ---------------------------------------------------------------------------
+# In-memory state for the API server
+# ---------------------------------------------------------------------------
+
+# ADK session service — in-memory for prototype
+_session_service = InMemorySessionService()
+
+# Track deferred items for the user to review later
+_deferred_items: list[DeferredItem] = []
+
+# User ID — fixed for single-user prototype
+_USER_ID = "abhiram"
+_APP_NAME = "app"
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+router = APIRouter(prefix="/api/v1/proxy", tags=["proxy"])
+
+
+async def _run_agent(transcript: str, session_id: str) -> str:
+    """Run the ADK orchestrator agent on a transcript chunk.
+
+    Creates a fresh orchestrator agent instance per request to avoid
+    parent-conflict issues, then executes it through the ADK Runner.
+    """
+    # Create a fresh orchestrator for this request (factory pattern)
+    orchestrator = create_orchestrator_agent()
+    runner = Runner(
+        agent=orchestrator,
+        app_name=_APP_NAME,
+        session_service=_session_service,
+    )
+
+    # Ensure session exists
+    session = await _session_service.get_session(
+        app_name=_APP_NAME,
+        user_id=_USER_ID,
+        session_id=session_id,
+    )
+    if session is None:
+        session = await _session_service.create_session(
+            app_name=_APP_NAME,
+            user_id=_USER_ID,
+            session_id=session_id,
+        )
+
+    # Build the user message
+    user_message = types.Content(
+        role="user",
+        parts=[types.Part.from_text(text=transcript)],
+    )
+
+    # Run the agent and collect the final response
+    final_response = ""
+    async for event in runner.run_async(
+        user_id=_USER_ID,
+        session_id=session_id,
+        new_message=user_message,
+    ):
+        if event.is_final_response() and event.content and event.content.parts:
+            for part in event.content.parts:
+                if part.text:
+                    final_response += part.text
+
+    return final_response or "[No response generated by the agent]"
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("/analyze", response_model=ProxyResponse)
+async def analyze_transcript(request: MeetingRequest) -> ProxyResponse:
+    """Analyze a meeting transcript chunk through the Stand-In Proxy.
+
+    Sends the transcript text to the ADK Orchestrator agent, which:
+    1. Determines if the question is directed at the user
+    2. Queries the RAG knowledge base for relevant facts
+    3. Synthesizes a guardrailed response via the Spokesperson agent
+
+    If the response hits the Authority Boundary, it is flagged as deferred.
+    """
+    session_id = request.session_id or str(uuid.uuid4())
+
+    try:
+        logger.info(
+            f"Processing transcript chunk (session={session_id}): "
+            f"{request.transcript_chunk[:80]}..."
+        )
+
+        agent_response = await _run_agent(request.transcript_chunk, session_id)
+
+        # Detect if the response was deferred (authority boundary triggered)
+        deferral_markers = [
+            "do not have the authority",
+            "flag this for",
+            "final approval",
+            "cannot commit",
+            "cannot agree",
+        ]
+        was_deferred = any(
+            marker in agent_response.lower() for marker in deferral_markers
+        )
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Track deferred items for later review
+        if was_deferred:
+            _deferred_items.append(
+                DeferredItem(
+                    transcript_chunk=request.transcript_chunk,
+                    agent_response=agent_response,
+                    timestamp=timestamp,
+                    session_id=session_id,
+                )
+            )
+            logger.warning(f"Response DEFERRED (authority boundary hit): {session_id}")
+
+        return ProxyResponse(
+            session_id=session_id,
+            agent_response=agent_response,
+            was_deferred=was_deferred,
+            timestamp=timestamp,
+        )
+
+    except Exception as e:
+        logger.error(f"Error processing transcript: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing transcript: {str(e)}",
+        )
+
+
+@router.get("/deferred", response_model=list[DeferredItem])
+async def get_deferred_items() -> list[DeferredItem]:
+    """Get all transcript items that were deferred due to the authority boundary.
+
+    These are items where the Spokesperson agent determined it could not
+    answer without the user's explicit approval (deadlines, budgets,
+    architectural decisions, etc.).
+    """
+    return _deferred_items
+
+
+@router.get("/status", response_model=HealthStatus)
+async def get_status() -> HealthStatus:
+    """Health check endpoint."""
+    return HealthStatus(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
