@@ -1,1 +1,2 @@
 .env
+deployment/terraform/single-project/vars/env.tfvars
